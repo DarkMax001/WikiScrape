@@ -1138,6 +1138,7 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
             AutoTokenizer,
             DataCollatorForLanguageModeling,
             Trainer,
+            TrainerCallback,
             TrainingArguments,
         )
     except Exception as exc:
@@ -1145,6 +1146,41 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
             "Training dependencies are missing. Install transformers, datasets, "
             "accelerate, torch and sentencepiece."
         ) from exc
+
+    class TrainingTimeLimitCallback(TrainerCallback):
+        """Stop Trainer after a wall-clock limit, checked after optimizer steps."""
+
+        def __init__(self, max_hours: float):
+            super().__init__()
+            self.max_seconds = max(0.0, float(max_hours)) * 3600.0
+            self.started_at: Optional[float] = None
+            self.elapsed_seconds = 0.0
+            self.time_limit_reached = False
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.started_at = time.monotonic()
+            if self.max_seconds > 0:
+                log(f"Training time limit: {self.max_seconds / 3600:.2f} hours (training loop only).")
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if self.started_at is None:
+                return control
+            self.elapsed_seconds = time.monotonic() - self.started_at
+            if self.max_seconds > 0 and self.elapsed_seconds >= self.max_seconds:
+                self.time_limit_reached = True
+                control.should_training_stop = True
+                log(
+                    f"Training time limit reached after {self.elapsed_seconds / 3600:.2f} hours; "
+                    "stopping after the current optimizer step and saving the model."
+                )
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            if self.started_at is not None:
+                self.elapsed_seconds = time.monotonic() - self.started_at
+            log(f"Training loop elapsed: {self.elapsed_seconds / 3600:.2f} hours.")
+            return control
 
     if not examples:
         raise RuntimeError("No training examples were loaded. Attach a JSONL dataset or scrape sources.")
@@ -1265,6 +1301,10 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**trainer_kwargs)
+    time_limit_callback = None
+    if args.max_training_hours > 0:
+        time_limit_callback = TrainingTimeLimitCallback(args.max_training_hours)
+        trainer.add_callback(time_limit_callback)
     log("Starting fine-tuning...")
     train_result = trainer.train()
 
@@ -1279,7 +1319,16 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "training_examples": len(train_dataset),
         "evaluation_examples": len(eval_dataset),
         "max_length": args.max_length,
-        "epochs": args.epochs,
+        "epochs_requested": args.epochs,
+        "max_training_hours": args.max_training_hours,
+        "training_loop_elapsed_hours": (
+            time_limit_callback.elapsed_seconds / 3600.0
+            if time_limit_callback is not None else None
+        ),
+        "training_time_limit_reached": (
+            time_limit_callback.time_limit_reached
+            if time_limit_callback is not None else False
+        ),
         "learning_rate": args.learning_rate,
         "seed": args.seed,
         "training_metrics": train_result.metrics,
@@ -1343,17 +1392,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-train", action="store_true", help="Only build and save the dataset")
     parser.add_argument("--max-search-results", type=int, default=int(os.environ.get("FLORR_SEARCH_RESULTS", "10")))
     parser.add_argument("--search-query-limit", type=int, default=int(os.environ.get("FLORR_SEARCH_QUERIES", str(len(SEARCH_QUERIES)))))
-    parser.add_argument("--max-scrapes", type=int, default=int(os.environ.get("FLORR_MAX_SCRAPES", "750")))
+    parser.add_argument("--max-scrapes", type=int, default=int(os.environ.get("FLORR_MAX_SCRAPES", "2000")))
     parser.add_argument("--map-limit", type=int, default=int(os.environ.get("FLORR_MAP_LIMIT", "15000")))
     parser.add_argument("--max-crawl-pages", type=int, default=int(os.environ.get("FLORR_CRAWL_PAGES", "5000")))
     parser.add_argument("--crawl-depth", type=int, default=int(os.environ.get("FLORR_CRAWL_DEPTH", "6")))
     parser.add_argument("--crawl-concurrency", type=int, default=int(os.environ.get("FLORR_CRAWL_CONCURRENCY", "8")))
     parser.add_argument("--qa-variants-per-chunk", type=int, default=int(os.environ.get("FLORR_QA_VARIANTS", "5")))
-    parser.add_argument("--web-data-ratio", type=float, default=float(os.environ.get("FLORR_WEB_DATA_RATIO", "1.50")))
-    parser.add_argument("--max-web-examples", type=int, default=int(os.environ.get("FLORR_MAX_WEB_EXAMPLES", "180000")))
+    parser.add_argument("--web-data-ratio", type=float, default=float(os.environ.get("FLORR_WEB_DATA_RATIO", "3.00")))
+    parser.add_argument("--max-web-examples", type=int, default=int(os.environ.get("FLORR_MAX_WEB_EXAMPLES", "250000")))
     parser.add_argument("--request-delay", type=float, default=float(os.environ.get("FLORR_REQUEST_DELAY", "0.35")))
 
     parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "3")))
+    parser.add_argument("--max-training-hours", type=float, default=float(os.environ.get("FLORR_MAX_TRAINING_HOURS", "9")), help="Stop fine-tuning after this many hours; 0 disables the time limit")
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("FLORR_BATCH_SIZE", "4")))
     parser.add_argument("--eval-batch-size", type=int, default=int(os.environ.get("FLORR_EVAL_BATCH_SIZE", "4")))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("FLORR_GRAD_ACCUM", "8")))
@@ -1382,6 +1432,14 @@ def main() -> int:
     log(f"Data directory: {data_dir}")
     log(f"Output directory: {output_dir}")
     log(f"Base model: {args.model}")
+    log(
+        f"Firecrawl limits: {min(args.search_query_limit, len(SEARCH_QUERIES))} queries, "
+        f"{args.max_search_results} results/query, up to {args.max_crawl_pages} crawl pages, "
+        f"{args.max_scrapes} extra scrapes, web ratio {args.web_data_ratio}x "
+        f"(cap {args.max_web_examples:,} examples)."
+    )
+    if args.max_training_hours > 0:
+        log(f"Fine-tuning will stop after at most {args.max_training_hours:g} training hours.")
 
     # 1) Download the primary GitHub JSONL source, then combine it with
     #    the normal JSON file(s) attached later under /kaggle/input.
