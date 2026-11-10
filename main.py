@@ -1355,10 +1355,25 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         pad_to_multiple_of=8 if use_cuda else None,
     )
 
-    # Transformers renamed evaluation_strategy -> eval_strategy in newer releases.
+    # Transformers has changed several TrainingArguments parameter names and
+    # availability across releases. Build arguments from the installed
+    # version's actual constructor signature instead of assuming a new version.
     import inspect
+    import math
+    import transformers
+
     ta_params = inspect.signature(TrainingArguments.__init__).parameters
-    eval_key = "eval_strategy" if "eval_strategy" in ta_params else "evaluation_strategy"
+    if "eval_strategy" in ta_params:
+        eval_key = "eval_strategy"
+    elif "evaluation_strategy" in ta_params:
+        eval_key = "evaluation_strategy"
+    else:
+        raise RuntimeError(
+            f"Installed Transformers {transformers.__version__} does not expose "
+            "eval_strategy or evaluation_strategy in TrainingArguments. "
+            "Upgrade with: pip install -U transformers accelerate"
+        )
+
     training_kwargs = {
         "output_dir": str(output_dir),
         "num_train_epochs": args.epochs,
@@ -1367,7 +1382,6 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": 0.01,
-        "warmup_ratio": 0.05,
         "lr_scheduler_type": "cosine",
         eval_key: "epoch",
         "save_strategy": "epoch",
@@ -1387,6 +1401,42 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "dataloader_num_workers": args.num_workers,
     }
 
+    # Preserve the intended 5% learning-rate warmup. Older Transformers
+    # releases have warmup_steps but do not have warmup_ratio.
+    if "warmup_ratio" in ta_params:
+        training_kwargs["warmup_ratio"] = 0.05
+    elif "warmup_steps" in ta_params:
+        device_count = max(1, torch.cuda.device_count() if use_cuda else 1)
+        micro_batches_per_epoch = math.ceil(
+            len(train_dataset) / (args.batch_size * device_count)
+        )
+        optimizer_steps_per_epoch = math.ceil(
+            micro_batches_per_epoch / max(1, args.gradient_accumulation_steps)
+        )
+        estimated_total_steps = max(1, math.ceil(optimizer_steps_per_epoch * args.epochs))
+        training_kwargs["warmup_steps"] = max(1, round(estimated_total_steps * 0.05))
+        log(
+            "Installed Transformers has no warmup_ratio; using "
+            f"warmup_steps={training_kwargs['warmup_steps']} (approximately 5%)."
+        )
+    else:
+        log(
+            "WARNING: Installed Transformers supports neither warmup_ratio nor "
+            "warmup_steps; continuing without LR warmup."
+        )
+
+    # Drop only parameters absent from this installed Transformers version.
+    # This also prevents the same kind of TypeError for other newer options.
+    unsupported = [key for key in training_kwargs if key not in ta_params]
+    for key in unsupported:
+        training_kwargs.pop(key)
+    if unsupported:
+        log(
+            f"Transformers {transformers.__version__} does not support these "
+            f"TrainingArguments options; skipping them: {', '.join(unsupported)}"
+        )
+
+    log(f"Using Transformers {transformers.__version__} TrainingArguments compatibility mode.")
     training_args = TrainingArguments(**training_kwargs)
     trainer_params = inspect.signature(Trainer.__init__).parameters
     trainer_kwargs = {
@@ -1490,6 +1540,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("FLORR_MODEL", MODEL_DEFAULT))
 
     parser.add_argument("--skip-scrape", action="store_true", help="Do not call Firecrawl")
+    parser.add_argument(
+        "--reuse-training-data",
+        action="store_true",
+        help="Train directly from data-dir/florr_training.jsonl without downloading or scraping again",
+    )
     parser.add_argument("--skip-train", action="store_true", help="Only build and save the dataset")
     parser.add_argument("--max-search-results", type=int, default=int(os.environ.get("FLORR_SEARCH_RESULTS", "10")))
     parser.add_argument("--search-query-limit", type=int, default=int(os.environ.get("FLORR_SEARCH_QUERIES", str(len(SEARCH_QUERIES)))))
@@ -1551,6 +1606,36 @@ def main() -> int:
     )
     if args.max_training_hours > 0:
         log(f"Fine-tuning will stop after at most {args.max_training_hours:g} training hours.")
+
+    # Reuse the already-built combined dataset. This is useful after a previous
+    # run completed scraping/data preparation but failed before training.
+    if args.reuse_training_data:
+        saved_dataset = data_dir / "florr_training.jsonl"
+        if not saved_dataset.is_file():
+            raise FileNotFoundError(
+                f"Cannot reuse dataset: {saved_dataset} does not exist. "
+                "Restore florr_training.jsonl into the data directory first."
+            )
+        reused_examples: List[dict] = []
+        for record in read_jsonl(saved_dataset):
+            if not isinstance(record, dict):
+                continue
+            add_qa(
+                reused_examples,
+                record.get("prompt", record.get("instruction", record.get("question", ""))),
+                record.get("answer", record.get("output", record.get("completion", ""))),
+                str(record.get("source", "saved_training_dataset")),
+                str(record.get("fact_type", "general")),
+                record.get("negative", False),
+            )
+        if not reused_examples:
+            raise RuntimeError(f"No valid prompt/answer rows found in {saved_dataset}")
+        log(f"Reusing saved dataset: {saved_dataset}")
+        log(f"Loaded {len(reused_examples):,} saved examples; skipping download and Firecrawl.")
+        print_dataset_stats(reused_examples)
+        train_model(reused_examples, args, output_dir)
+        log("Training from the saved dataset completed successfully.")
+        return 0
 
     # 1) Download the primary GitHub JSONL source, then combine it with
     #    the normal JSON file(s) attached later under /kaggle/input.
