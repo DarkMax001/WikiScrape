@@ -1429,6 +1429,86 @@ def documents_to_examples(
     return result
 
 
+def load_existing_scraped_documents(input_dir: Path) -> List[dict]:
+    """Load previously scraped Firecrawl pages uploaded as a Kaggle input dataset.
+
+    Search caches/results are not training documents. This function imports only
+    saved page records from files named scraped_documents.jsonl and normalizes
+    their text into the same title/url/content shape used by Firecrawl itself.
+    """
+    if not input_dir.exists():
+        return []
+
+    candidates = sorted(
+        (path for path in input_dir.rglob("*")
+         if path.is_file() and path.name.lower() == "scraped_documents.jsonl"),
+        key=lambda path: str(path).lower(),
+    )
+    documents_by_url: Dict[str, dict] = {}
+
+    for path in candidates:
+        imported = 0
+        for record in read_jsonl(path):
+            if not isinstance(record, dict):
+                continue
+            raw_content = record.get("content") or record.get("markdown") or record.get("text") or ""
+            content = clean_markdown(safe_text(raw_content))
+            if len(content) < 220:
+                continue
+
+            metadata = record.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            url = (
+                record.get("url")
+                or record.get("source_url")
+                or record.get("sourceURL")
+                or metadata.get("source_url")
+                or metadata.get("sourceURL")
+                or metadata.get("url")
+                or ""
+            )
+            title = (
+                record.get("title")
+                or metadata.get("title")
+                or (str(url).rstrip("/").split("/")[-1] if url else path.stem)
+            )
+            canonical = str(url).split("#", 1)[0].rstrip("/") if url else f"{path}#{imported}"
+            document = {
+                "title": safe_text(title),
+                "url": canonical,
+                "content": content,
+            }
+            previous = documents_by_url.get(canonical)
+            if previous is None or len(content) > len(previous.get("content", "")):
+                documents_by_url[canonical] = document
+            imported += 1
+
+        log(f"Loaded {imported:,} saved Firecrawl page(s) from {path}.")
+
+    documents = list(documents_by_url.values())
+    log(f"Total saved Firecrawl documents imported from Kaggle input: {len(documents):,}.")
+    return documents
+
+
+def merge_scraped_documents(*document_sets: List[dict]) -> List[dict]:
+    """Merge page collections by canonical URL, keeping the richest content."""
+    merged: Dict[str, dict] = {}
+    for group in document_sets:
+        for document in group:
+            if not isinstance(document, dict):
+                continue
+            url = str(document.get("url", "")).split("#", 1)[0].rstrip("/")
+            if not url:
+                url = f"untitled:{document.get('title', '')}"
+            candidate = dict(document)
+            candidate["url"] = url
+            previous = merged.get(url)
+            if previous is None or len(str(candidate.get("content", ""))) > len(str(previous.get("content", ""))):
+                merged[url] = candidate
+    return list(merged.values())
+
+
 # ---------------------------------------------------------------------------
 # Cleaning, deduplication and dataset files
 # ---------------------------------------------------------------------------
@@ -1923,11 +2003,15 @@ def main() -> int:
         "prepared dataset, uploaded JSON files, and chat text files."
     )
 
-    # 2) Optionally gather web references.
-    documents: List[dict] = []
+    # 2) Load saved Firecrawl documents already attached as a Kaggle input.
+    # Search caches/results are metadata; scraped_documents.jsonl contains the
+    # actual page content and is imported through this dedicated document path.
+    documents: List[dict] = load_existing_scraped_documents(input_dir)
+
+    # 3) Optionally gather additional, fresh web references with Firecrawl.
     api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
     if not args.skip_scrape and api_key:
-        documents = firecrawl_research(
+        fresh_documents = firecrawl_research(
             api_key=api_key,
             data_dir=data_dir,
             max_search_results=args.max_search_results,
@@ -1940,12 +2024,17 @@ def main() -> int:
             crawl_depth=args.crawl_depth,
             crawl_concurrency=args.crawl_concurrency,
         )
+        documents = merge_scraped_documents(documents, fresh_documents)
     elif args.skip_scrape:
-        log("Scraping disabled by --skip-scrape.")
+        log("Fresh Firecrawl scraping disabled by --skip-scrape; using any saved input documents.")
     else:
-        log("FIRECRAWL_API_KEY is not set; skipping web scraping.")
+        log("FIRECRAWL_API_KEY is not set; using any saved input documents without fresh scraping.")
 
-    # 3) Convert web articles into chunks and QA training rows.
+    # Keep one combined copy in the working output for reproducibility.
+    if documents:
+        write_jsonl(data_dir / "scraped_documents.jsonl", documents)
+
+    # 4) Convert web articles into chunks and QA training rows.
     scraped_examples = documents_to_examples(documents, args.qa_variants_per_chunk)
     scraped_examples_generated_before_cap = len(scraped_examples)
     # Default: target roughly one Firecrawl row per primary dataset row.
@@ -1963,7 +2052,7 @@ def main() -> int:
         scraped_examples = scraped_examples[:web_cap]
     log(f"Using {len(scraped_examples):,} scraped-reference example(s).")
 
-    # 4) Combine, deduplicate, persist.
+    # 5) Combine, deduplicate, persist.
     all_examples = deduplicate_examples(user_examples + scraped_examples)
     random.shuffle(all_examples)
     write_jsonl(data_dir / "florr_training.jsonl", all_examples)
@@ -2009,7 +2098,7 @@ def main() -> int:
         log(f"Dataset-only run complete: {data_dir / 'florr_training.jsonl'}")
         return 0
 
-    # 5) Fine-tune and export.
+    # 6) Fine-tune and export.
     train_model(all_examples, args, output_dir)
     log("All tasks completed successfully.")
     return 0
