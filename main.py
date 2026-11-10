@@ -5,7 +5,7 @@ What it does:
   1. Downloads the primary expanded-intent JSONL dataset from GitHub.
   2. Merges an existing prepared florr_training.jsonl when one is uploaded.
   3. Imports uploaded JSON files and messages.txt chat logs (plus optional JSONL).
-  4. Researches Florr.io with the original Firecrawl search/map/deep-crawl/scrape flow.
+  4. Reuses previously scraped Firecrawl exports without making new Firecrawl requests.
   5. Cleans/deduplicates the combined data and fine-tunes SmolLM2-135M-Instruct.
   6. Saves the final training dataset, source manifest, and fine-tuned model.
 
@@ -498,6 +498,7 @@ def find_and_extract_results_dataset(input_dir: Path, data_dir: Path) -> Optiona
             return destination
     except zipfile.BadZipFile as exc:
         raise RuntimeError(f"The uploaded file is not a valid ZIP archive: {archive_path}") from exc
+
 def find_prepared_training_dataset(input_dir: Path, data_dir: Path) -> Optional[Path]:
     """Find an already-prepared florr_training.jsonl uploaded as a Kaggle Dataset.
 
@@ -1597,6 +1598,45 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
             log(f"Training loop elapsed: {self.elapsed_seconds / 3600:.2f} hours.")
             return control
 
+    class PeriodicCheckpointCallback(TrainerCallback):
+        """Request a resumable Trainer checkpoint at a wall-clock interval."""
+
+        def __init__(self, interval_minutes: float):
+            super().__init__()
+            if interval_minutes <= 0:
+                raise ValueError("--save-interval-minutes must be greater than 0")
+            self.interval_seconds = float(interval_minutes) * 60.0
+            self.last_checkpoint_at: Optional[float] = None
+            self.save_requested = False
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.last_checkpoint_at = time.monotonic()
+            log(
+                f"Periodic checkpointing enabled: every "
+                f"{self.interval_seconds / 60:g} minute(s). "
+                "Only the newest checkpoint will be retained."
+            )
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if self.last_checkpoint_at is None or self.save_requested:
+                return control
+            elapsed = time.monotonic() - self.last_checkpoint_at
+            if elapsed >= self.interval_seconds:
+                control.should_save = True
+                self.save_requested = True
+                log(
+                    f"Checkpoint interval reached ({elapsed / 60:.1f} min); "
+                    f"saving after optimizer step {state.global_step}."
+                )
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            self.last_checkpoint_at = time.monotonic()
+            self.save_requested = False
+            log(f"Checkpoint saved at global step {state.global_step}.")
+            return control
+
     if not examples:
         raise RuntimeError("No training examples were loaded. Attach a JSONL dataset or scrape sources.")
 
@@ -1710,19 +1750,20 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         # deliberately high epoch ceiling used to keep training alive for 7h.
         "lr_scheduler_type": "constant_with_warmup",
         eval_key: "steps",
-        "save_strategy": "steps",
+        # Saving is triggered by PeriodicCheckpointCallback using wall-clock
+        # time, not by epochs or a fixed number of optimizer steps.
+        "save_strategy": "no",
         "eval_steps": 1000,
-        "save_steps": 1000,
         "logging_strategy": "steps",
         "logging_steps": 25,
         "fp16": bool(use_cuda and not args.no_fp16),
         "bf16": False,
         "gradient_checkpointing": bool(use_cuda and not args.no_gradient_checkpointing),
         "optim": "adamw_torch",
-        "save_total_limit": 2,
-        "load_best_model_at_end": True,
-        "metric_for_best_model": "eval_loss",
-        "greater_is_better": False,
+        # Keep only the newest five-minute checkpoint in output_dir.
+        "save_total_limit": 1,
+        # Custom wall-clock checkpointing replaces best-checkpoint selection.
+        "load_best_model_at_end": False,
         "report_to": "none",
         "seed": args.seed,
         "data_seed": args.seed,
@@ -1768,6 +1809,9 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**trainer_kwargs)
+    checkpoint_callback = PeriodicCheckpointCallback(args.save_interval_minutes)
+    trainer.add_callback(checkpoint_callback)
+
     time_limit_callback = None
     if args.max_training_hours > 0:
         time_limit_callback = TrainingTimeLimitCallback(args.max_training_hours)
@@ -1788,6 +1832,7 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "max_length": args.max_length,
         "epochs_requested": args.epochs,
         "max_training_hours": args.max_training_hours,
+        "save_interval_minutes": args.save_interval_minutes,
         "training_loop_elapsed_hours": (
             time_limit_callback.elapsed_seconds / 3600.0
             if time_limit_callback is not None else None
@@ -1855,7 +1900,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=os.environ.get("FLORR_OUTPUT_DIR", "/kaggle/working/florr-smollm2-135m"))
     parser.add_argument("--model", default=os.environ.get("FLORR_MODEL", MODEL_DEFAULT))
 
-    parser.add_argument("--skip-scrape", action="store_true", help="Do not call Firecrawl")
+    parser.add_argument("--skip-scrape", action="store_true", help="Compatibility flag; fresh Firecrawl is disabled in this file")
     parser.add_argument(
         "--reuse-training-data",
         action="store_true",
@@ -1892,6 +1937,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "1000")), help="Safety ceiling for epochs; the 7-hour time limit normally stops training first")
     parser.add_argument("--max-training-hours", type=float, default=float(os.environ.get("FLORR_MAX_TRAINING_HOURS", "7")), help="Stop fine-tuning after this many hours; 0 disables the time limit")
+    parser.add_argument(
+        "--save-interval-minutes",
+        type=float,
+        default=float(os.environ.get("FLORR_SAVE_INTERVAL_MINUTES", "5")),
+        help="Save a resumable checkpoint every N minutes (default: 5).",
+    )
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("FLORR_BATCH_SIZE", "4")))
     parser.add_argument("--eval-batch-size", type=int, default=int(os.environ.get("FLORR_EVAL_BATCH_SIZE", "4")))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("FLORR_GRAD_ACCUM", "8")))
@@ -1921,18 +1972,12 @@ def main() -> int:
     log(f"Data directory: {data_dir}")
     log(f"Output directory: {output_dir}")
     log(f"Base model: {args.model}")
-    log(
-        f"Firecrawl limits: {min(args.search_query_limit, len(SEARCH_QUERIES))} queries, "
-        f"{args.max_search_results} results/query, up to {args.max_crawl_pages} crawl pages, "
-        f"{args.max_scrapes} extra scrapes, web ratio {args.web_data_ratio}x "
-        f"(cap {args.max_web_examples:,} examples); search spacing {args.search_delay:g}s."
-    )
+    log("Fresh Firecrawl search, map, crawl, and scrape requests are disabled.")
     if args.max_training_hours > 0:
         log(f"Fine-tuning will stop after at most {args.max_training_hours:g} training hours.")
 
     # Kaggle convenience: detect an uploaded Results.zip or prepared JSONL.
-    # It is merged as another dataset source; it does not skip remote downloads
-    # or Firecrawl. Only the explicit --reuse-training-data flag skips those steps.
+    # It is merged as another dataset source. Fresh Firecrawl requests are disabled.
     prepared_input_dataset: Optional[Path] = None
     if args.auto_results_zip and not args.reuse_training_data:
         # Prefer Results.zip when supplied. Otherwise accept a normal Kaggle
@@ -2008,27 +2053,9 @@ def main() -> int:
     # actual page content and is imported through this dedicated document path.
     documents: List[dict] = load_existing_scraped_documents(input_dir)
 
-    # 3) Optionally gather additional, fresh web references with Firecrawl.
-    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
-    if not args.skip_scrape and api_key:
-        fresh_documents = firecrawl_research(
-            api_key=api_key,
-            data_dir=data_dir,
-            max_search_results=args.max_search_results,
-            max_scrapes=args.max_scrapes,
-            search_query_limit=args.search_query_limit,
-            map_limit=args.map_limit,
-            delay=args.request_delay,
-            search_delay=args.search_delay,
-            max_crawl_pages=args.max_crawl_pages,
-            crawl_depth=args.crawl_depth,
-            crawl_concurrency=args.crawl_concurrency,
-        )
-        documents = merge_scraped_documents(documents, fresh_documents)
-    elif args.skip_scrape:
-        log("Fresh Firecrawl scraping disabled by --skip-scrape; using any saved input documents.")
-    else:
-        log("FIRECRAWL_API_KEY is not set; using any saved input documents without fresh scraping.")
+    # 3) Fresh Firecrawl is intentionally disabled. Reuse only documents
+    # already present in the attached Kaggle input datasets.
+    log("Reusing saved Firecrawl documents only; no Firecrawl API requests will be made.")
 
     # Keep one combined copy in the working output for reproducibility.
     if documents:
