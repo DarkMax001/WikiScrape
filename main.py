@@ -2,11 +2,11 @@
 """Florr.io SmolLM2 fine-tuning pipeline for Kaggle (rate-limit-safe, resumable search).
 
 What it does:
-  1. Imports JSONL/JSON chat and QA datasets from /kaggle/input.
-  2. Searches and deeply crawls Florr.io reference sites with Firecrawl.
-  3. Converts each useful section/chunk into multiple source-grounded QA variants.
-  4. Cleans/deduplicates and splits the combined data.
-  5. Fine-tunes SmolLM2-135M-Instruct and saves the model + datasets.
+  1. Automatically detects Results.zip under /kaggle/input and reuses its
+     prepared florr_training.jsonl, when present.
+  2. Otherwise, imports JSONL/JSON datasets and can research with Firecrawl.
+  3. Cleans/deduplicates and splits the combined data when building from sources.
+  4. Fine-tunes SmolLM2-135M-Instruct and saves the model + datasets.
 
 Configure with environment variables or CLI flags. Never put a real API key
 in a public GitHub file; use Kaggle Secrets instead.
@@ -20,10 +20,12 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 import time
 import traceback
 import urllib.error
+import zipfile
 import urllib.request
 from collections import Counter
 from pathlib import Path
@@ -402,6 +404,99 @@ def read_jsonl(path: Path) -> Iterable[Any]:
                 yield json.loads(line)
             except json.JSONDecodeError:
                 log(f"Skipping malformed JSON in {path.name}, line {line_number}")
+
+
+def find_and_extract_results_dataset(input_dir: Path, data_dir: Path) -> Optional[Path]:
+    """Find Results.zip under the Kaggle input mount and extract its prepared JSONL.
+
+    Only the selected JSONL member is streamed to a fixed destination. This avoids
+    extracting arbitrary archive paths and prevents ZIP path-traversal issues.
+    """
+    if not input_dir.exists():
+        log(f"Kaggle input directory does not exist: {input_dir}")
+        return None
+
+    archives = [
+        path for path in input_dir.rglob("*.zip")
+        if path.is_file() and path.name.lower() == "results.zip"
+    ]
+    # Be tolerant of a differently-cased extension/name while still prioritizing
+    # the exact Results.zip requested by the user.
+    if not archives:
+        archives = [
+            path for path in input_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() == ".zip"
+            and "result" in path.stem.lower()
+        ]
+
+    if not archives:
+        log("No Results.zip found under the input directory; continuing with normal dataset discovery.")
+        return None
+
+    archives.sort(key=lambda path: (0 if path.name.lower() == "results.zip" else 1, str(path).lower()))
+    archive_path = archives[0]
+    log(f"Found uploaded archive: {archive_path}")
+
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            candidates = []
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                member = info.filename.replace("\\", "/")
+                parts = [part for part in member.split("/") if part not in ("", ".")]
+                if not parts or ".." in parts:
+                    continue
+                if parts[-1].lower() == "florr_training.jsonl":
+                    # Prefer the expected florr_data/florr_training.jsonl location.
+                    expected = 0 if [part.lower() for part in parts[-2:]] == ["florr_data", "florr_training.jsonl"] else 1
+                    candidates.append((expected, len(parts), info))
+
+            if not candidates:
+                listed = [
+                    info.filename for info in archive.infolist()
+                    if not info.is_dir() and info.filename.lower().endswith((".jsonl", ".json"))
+                ]
+                preview = ", ".join(listed[:8]) if listed else "(no JSON/JSONL files found)"
+                raise FileNotFoundError(
+                    f"{archive_path.name} does not contain florr_training.jsonl. "
+                    f"JSON/JSONL files present: {preview}. Upload the Results.zip generated "
+                    "by the FlorrAI data-preparation run."
+                )
+
+            candidates.sort(key=lambda item: (item[0], item[1], item[2].filename.lower()))
+            selected = candidates[0][2]
+            if selected.file_size <= 0:
+                raise ValueError(f"{selected.filename} inside {archive_path.name} is empty.")
+            if selected.file_size > 3 * 1024 * 1024 * 1024:
+                raise ValueError(
+                    f"Refusing to extract unexpectedly large dataset ({selected.file_size:,} bytes)."
+                )
+
+            destination = data_dir / "florr_training.jsonl"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".extracting")
+            log(
+                f"Extracting {selected.filename} from Results.zip "
+                f"({selected.file_size:,} bytes)..."
+            )
+            try:
+                with archive.open(selected, "r") as source, temporary.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                if temporary.stat().st_size != selected.file_size:
+                    raise IOError(
+                        f"Extracted size mismatch: expected {selected.file_size:,} bytes, "
+                        f"got {temporary.stat().st_size:,} bytes."
+                    )
+                temporary.replace(destination)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+
+            log(f"Prepared dataset extracted to: {destination}")
+            return destination
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"The uploaded file is not a valid ZIP archive: {archive_path}") from exc
 
 
 def add_qa(
@@ -1545,6 +1640,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train directly from data-dir/florr_training.jsonl without downloading or scraping again",
     )
+    parser.add_argument(
+        "--no-auto-results-zip",
+        dest="auto_results_zip",
+        action="store_false",
+        default=True,
+        help="Disable automatic detection/extraction of Results.zip under the input directory",
+    )
     parser.add_argument("--skip-train", action="store_true", help="Only build and save the dataset")
     parser.add_argument("--max-search-results", type=int, default=int(os.environ.get("FLORR_SEARCH_RESULTS", "10")))
     parser.add_argument("--search-query-limit", type=int, default=int(os.environ.get("FLORR_SEARCH_QUERIES", str(len(SEARCH_QUERIES)))))
@@ -1567,12 +1669,12 @@ def parse_args() -> argparse.Namespace:
         help="Pause between Firecrawl search calls; 7s stays below a 10-requests/minute limit.",
     )
 
-    parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "3")))
+    parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "10")))
     parser.add_argument("--max-training-hours", type=float, default=float(os.environ.get("FLORR_MAX_TRAINING_HOURS", "9")), help="Stop fine-tuning after this many hours; 0 disables the time limit")
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("FLORR_BATCH_SIZE", "4")))
     parser.add_argument("--eval-batch-size", type=int, default=int(os.environ.get("FLORR_EVAL_BATCH_SIZE", "4")))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("FLORR_GRAD_ACCUM", "8")))
-    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("FLORR_LR", "2e-5")))
+    parser.add_argument("--learning-rate", type=float, default=float(os.environ.get("FLORR_LR", "1e-5")))
     parser.add_argument("--max-length", type=int, default=int(os.environ.get("FLORR_MAX_LENGTH", "768")))
     parser.add_argument("--eval-fraction", type=float, default=float(os.environ.get("FLORR_EVAL_FRACTION", "0.05")))
     parser.add_argument("--num-workers", type=int, default=int(os.environ.get("FLORR_NUM_WORKERS", "2")))
@@ -1606,6 +1708,15 @@ def main() -> int:
     )
     if args.max_training_hours > 0:
         log(f"Fine-tuning will stop after at most {args.max_training_hours:g} training hours.")
+
+    # Kaggle convenience: when Results.zip is uploaded as an input dataset,
+    # automatically extract the already-prepared combined dataset and jump
+    # directly to fine-tuning. This intentionally bypasses GitHub downloads
+    # and Firecrawl so the long data-preparation stage is not repeated.
+    if args.auto_results_zip and not args.reuse_training_data:
+        extracted_dataset = find_and_extract_results_dataset(input_dir, data_dir)
+        if extracted_dataset is not None:
+            args.reuse_training_data = True
 
     # Reuse the already-built combined dataset. This is useful after a previous
     # run completed scraping/data preparation but failed before training.
