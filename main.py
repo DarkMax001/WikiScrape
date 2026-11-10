@@ -499,6 +499,54 @@ def find_and_extract_results_dataset(input_dir: Path, data_dir: Path) -> Optiona
         raise RuntimeError(f"The uploaded file is not a valid ZIP archive: {archive_path}") from exc
 
 
+def find_prepared_training_dataset(input_dir: Path, data_dir: Path) -> Optional[Path]:
+    """Find an already-prepared florr_training.jsonl uploaded as a Kaggle Dataset.
+
+    Kaggle mounts uploaded datasets as directories under /kaggle/input, so this
+    searches recursively and copies the prepared file into the writable working
+    data directory. It intentionally looks for the canonical filename to avoid
+    accidentally treating raw chat exports or unrelated JSONL files as a final
+    training set.
+    """
+    if not input_dir.exists():
+        return None
+
+    candidates = [
+        path for path in input_dir.rglob("florr_training.jsonl")
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+
+    # Prefer the canonical florr_data/florr_training.jsonl layout, then the
+    # shortest path for predictable selection if multiple datasets are attached.
+    candidates.sort(key=lambda path: (
+        0 if [part.lower() for part in path.parts[-2:]] == ["florr_data", "florr_training.jsonl"] else 1,
+        len(path.parts),
+        str(path).lower(),
+    ))
+    source = candidates[0]
+    destination = data_dir / "florr_training.jsonl"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if source.resolve() == destination.resolve():
+        return destination
+
+    log(f"Found prepared training dataset in Kaggle input: {source}")
+    temporary = destination.with_suffix(destination.suffix + ".copying")
+    try:
+        shutil.copyfile(source, temporary)
+        if temporary.stat().st_size <= 0:
+            raise ValueError(f"Prepared dataset is empty: {source}")
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+    log(f"Copied prepared dataset to: {destination} ({destination.stat().st_size:,} bytes).")
+    return destination
+
+
 def add_qa(
     target: List[dict],
     prompt: Any,
@@ -1714,8 +1762,12 @@ def main() -> int:
     # directly to fine-tuning. This intentionally bypasses GitHub downloads
     # and Firecrawl so the long data-preparation stage is not repeated.
     if args.auto_results_zip and not args.reuse_training_data:
-        extracted_dataset = find_and_extract_results_dataset(input_dir, data_dir)
-        if extracted_dataset is not None:
+        # Prefer Results.zip when supplied. Otherwise accept a normal Kaggle
+        # Dataset containing florr_training.jsonl directly (no ZIP required).
+        prepared_dataset = find_and_extract_results_dataset(input_dir, data_dir)
+        if prepared_dataset is None:
+            prepared_dataset = find_prepared_training_dataset(input_dir, data_dir)
+        if prepared_dataset is not None:
             args.reuse_training_data = True
 
     # Reuse the already-built combined dataset. This is useful after a previous
