@@ -2,11 +2,12 @@
 """Florr.io SmolLM2 fine-tuning pipeline for Kaggle (rate-limit-safe, resumable search).
 
 What it does:
-  1. Automatically detects Results.zip under /kaggle/input and reuses its
-     prepared florr_training.jsonl, when present.
-  2. Otherwise, imports JSONL/JSON datasets and can research with Firecrawl.
-  3. Cleans/deduplicates and splits the combined data when building from sources.
-  4. Fine-tunes SmolLM2-135M-Instruct and saves the model + datasets.
+  1. Downloads the primary expanded-intent JSONL dataset from GitHub.
+  2. Merges an existing prepared florr_training.jsonl when one is uploaded.
+  3. Imports uploaded JSON files and messages.txt chat logs (plus optional JSONL).
+  4. Researches Florr.io with the original Firecrawl search/map/deep-crawl/scrape flow.
+  5. Cleans/deduplicates the combined data and fine-tunes SmolLM2-135M-Instruct.
+  6. Saves the final training dataset, source manifest, and fine-tuned model.
 
 Configure with environment variables or CLI flags. Never put a real API key
 in a public GitHub file; use Kaggle Secrets instead.
@@ -497,8 +498,6 @@ def find_and_extract_results_dataset(input_dir: Path, data_dir: Path) -> Optiona
             return destination
     except zipfile.BadZipFile as exc:
         raise RuntimeError(f"The uploaded file is not a valid ZIP archive: {archive_path}") from exc
-
-
 def find_prepared_training_dataset(input_dir: Path, data_dir: Path) -> Optional[Path]:
     """Find an already-prepared florr_training.jsonl uploaded as a Kaggle Dataset.
 
@@ -627,7 +626,7 @@ def download_remote_jsonl(url: str, destination: Path, retries: int = 4) -> Opti
         log(f"Using cached copy: {destination}")
         return destination
 
-    log("WARNING: primary GitHub dataset could not be downloaded; continuing with uploaded JSON files.")
+    log("WARNING: primary GitHub dataset could not be downloaded; continuing with available uploaded inputs.")
     return None
 
 
@@ -705,6 +704,18 @@ def process_record(
             target,
             record.get("instruction"),
             record.get("output"),
+            source,
+            record.get("fact_type", "general"),
+            record.get("negative", False),
+        )
+        return
+
+    # This pipeline's own prepared dataset uses prompt/answer (not prompt/completion).
+    if "prompt" in record and "answer" in record:
+        add_qa(
+            target,
+            record.get("prompt"),
+            record.get("answer"),
             source,
             record.get("fact_type", "general"),
             record.get("negative", False),
@@ -815,6 +826,72 @@ def process_record(
             process_record(child, target, source, depth + 1, key)
 
 
+def is_excluded_dataset_file(path: Path) -> bool:
+    """Exclude Hugging Face repo metadata and Firecrawl intermediate files."""
+    name = path.name.lower()
+    if "huggingface" in name or "hugging_face" in name:
+        return True
+    if name in {
+        "__huggingface_repos__.json",
+        "hugging face.json",
+        "hugging_face.json",
+        "firecrawl_search_cache.jsonl",
+        "firecrawl_search_results.jsonl",
+        "scraped_documents.jsonl",
+    }:
+        return True
+    return name.startswith("firecrawl_")
+
+
+def import_plain_text_chat(
+    path: Path,
+    target: List[dict],
+    context_messages: int = 4,
+) -> None:
+    """Convert a one-message-per-line chat log into next-message examples.
+
+    No author/role metadata is present in this file, so messages remain neutral:
+    the preceding messages are context and the current line is the target reply.
+    """
+    history: List[str] = []
+    added = 0
+    usable_messages = 0
+    window = max(1, int(context_messages))
+
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        for raw_line in handle:
+            message = normalize_text(raw_line)
+            if len(message) < 2:
+                continue
+
+            if history:
+                recent = history[-window:]
+                prompt = (
+                    "Continue this Florr.io community chat naturally. "
+                    "The messages are from different community members. "
+                    "Write only the next short chat message. Do not claim to be "
+                    "one of the people in the chat. Recent messages: "
+                    + " | ".join(recent)
+                )
+                before = len(target)
+                add_qa(
+                    target,
+                    prompt,
+                    message,
+                    path.name,
+                    "community_chat_next_message",
+                )
+                added += len(target) - before
+
+            history.append(message)
+            usable_messages += 1
+
+    log(
+        f"{path.name}: imported {added:,} next-message examples "
+        f"from {usable_messages:,} non-empty messages."
+    )
+
+
 def load_user_datasets(
     input_dir: Path,
     extra_files: Sequence[str],
@@ -824,28 +901,42 @@ def load_user_datasets(
     raw_records: List[dict] = []
     files: List[Path] = []
 
-    # The GitHub JSONL source is downloaded and passed explicitly. By default,
-    # Kaggle /kaggle/input is scanned for the second, user-uploaded normal JSON.
-    # Extra files can still be supplied explicitly in either JSON or JSONL form.
+    # The GitHub JSONL and any prepared training dataset are passed explicitly.
+    # Kaggle /kaggle/input is also scanned for user JSON files and messages.txt;
+    # optional JSONL discovery remains available through --include-input-jsonl.
     if input_dir.exists():
         if include_input_jsonl:
-            files.extend(p for p in input_dir.rglob("*.jsonl") if p.is_file())
-        files.extend(p for p in input_dir.rglob("*.json") if p.is_file())
+            files.extend(
+                p for p in input_dir.rglob("*.jsonl")
+                if p.is_file() and not is_excluded_dataset_file(p)
+            )
+        files.extend(
+            p for p in input_dir.rglob("*.json")
+            if p.is_file() and not is_excluded_dataset_file(p)
+        )
+        files.extend(
+            p for p in input_dir.rglob("*")
+            if p.is_file() and p.name.lower() == "messages.txt"
+            and not is_excluded_dataset_file(p)
+        )
 
     for item in extra_files:
         p = Path(item)
-        if p.exists() and p.is_file():
+        if p.exists() and p.is_file() and not is_excluded_dataset_file(p):
             files.append(p)
         else:
             log(f"Extra dataset path does not exist: {item}")
 
     # Avoid reading our own generated files if output is under the input tree.
     unique_files = sorted(set(files), key=lambda p: str(p))
-    log(f"Found {len(unique_files)} JSON/JSONL input file(s).")
+    log(f"Found {len(unique_files)} JSON/JSONL/TXT input file(s).")
 
     for path in unique_files:
         before = len(examples)
         try:
+            if path.suffix.lower() == ".txt":
+                import_plain_text_chat(path, examples)
+                continue
             if path.suffix.lower() == ".jsonl":
                 records = read_jsonl(path)
             else:
@@ -1759,18 +1850,21 @@ def main() -> int:
     if args.max_training_hours > 0:
         log(f"Fine-tuning will stop after at most {args.max_training_hours:g} training hours.")
 
-    # Kaggle convenience: when Results.zip is uploaded as an input dataset,
-    # automatically extract the already-prepared combined dataset and jump
-    # directly to fine-tuning. This intentionally bypasses GitHub downloads
-    # and Firecrawl so the long data-preparation stage is not repeated.
+    # Kaggle convenience: detect an uploaded Results.zip or prepared JSONL.
+    # It is merged as another dataset source; it does not skip remote downloads
+    # or Firecrawl. Only the explicit --reuse-training-data flag skips those steps.
+    prepared_input_dataset: Optional[Path] = None
     if args.auto_results_zip and not args.reuse_training_data:
         # Prefer Results.zip when supplied. Otherwise accept a normal Kaggle
         # Dataset containing florr_training.jsonl directly (no ZIP required).
-        prepared_dataset = find_and_extract_results_dataset(input_dir, data_dir)
-        if prepared_dataset is None:
-            prepared_dataset = find_prepared_training_dataset(input_dir, data_dir)
-        if prepared_dataset is not None:
-            args.reuse_training_data = True
+        prepared_input_dataset = find_and_extract_results_dataset(input_dir, data_dir)
+        if prepared_input_dataset is None:
+            prepared_input_dataset = find_prepared_training_dataset(input_dir, data_dir)
+        if prepared_input_dataset is not None:
+            log(
+                "Will MERGE the existing prepared dataset with the remote JSONL, "
+                "uploaded datasets, messages.txt, and Firecrawl results."
+            )
 
     # Reuse the already-built combined dataset. This is useful after a previous
     # run completed scraping/data preparation but failed before training.
@@ -1802,8 +1896,8 @@ def main() -> int:
         log("Training from the saved dataset completed successfully.")
         return 0
 
-    # 1) Download the primary GitHub JSONL source, then combine it with
-    #    the normal JSON file(s) attached later under /kaggle/input.
+    # 1) Download the primary GitHub JSONL source, then combine it with the
+    #    prepared dataset and user-uploaded JSON/chat inputs under /kaggle/input.
     primary_jsonl = None
     if not args.skip_remote_jsonl:
         primary_jsonl = download_remote_jsonl(
@@ -1816,13 +1910,18 @@ def main() -> int:
     explicit_files = list(args.extra_files)
     if primary_jsonl is not None:
         explicit_files.append(str(primary_jsonl))
+    if prepared_input_dataset is not None:
+        explicit_files.append(str(prepared_input_dataset))
 
     user_examples, _raw_records = load_user_datasets(
         input_dir,
         explicit_files,
         include_input_jsonl=args.include_input_jsonl,
     )
-    log(f"Imported {len(user_examples):,} examples from the GitHub JSONL + uploaded JSON/extra files.")
+    log(
+        f"Imported {len(user_examples):,} examples from the GitHub JSONL, "
+        "prepared dataset, uploaded JSON files, and chat text files."
+    )
 
     # 2) Optionally gather web references.
     documents: List[dict] = []
@@ -1872,7 +1971,14 @@ def main() -> int:
         "primary_github_jsonl_url": args.remote_jsonl_url if not args.skip_remote_jsonl else None,
         "primary_github_jsonl_downloaded": bool(primary_jsonl),
         "uploaded_input_directory": str(input_dir),
-        "uploaded_normal_json_files": sorted(p.name for p in input_dir.rglob("*.json")) if input_dir.exists() else [],
+        "uploaded_normal_json_files": sorted(
+            p.name for p in input_dir.rglob("*.json")
+            if p.is_file() and not is_excluded_dataset_file(p)
+        ) if input_dir.exists() else [],
+        "uploaded_chat_text_files": sorted(
+            p.name for p in input_dir.rglob("*")
+            if p.is_file() and p.name.lower() == "messages.txt"
+        ) if input_dir.exists() else [],
         "input_jsonl_scan_enabled": bool(args.include_input_jsonl),
         "firecrawl_query_count_configured": min(args.search_query_limit, len(SEARCH_QUERIES)),
         "firecrawl_scraped_documents": len(documents),
