@@ -1438,9 +1438,18 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         tokenizer.pad_token = tokenizer.eos_token
 
     use_cuda = torch.cuda.is_available()
-    dtype = torch.float16 if use_cuda else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    # Keep trainable parameters in FP32. Trainer/Accelerate applies FP16
+    # autocast during the forward pass on CUDA. Loading the model itself in
+    # FP16 while also enabling TrainingArguments(fp16=True) can leave FP16
+    # gradients for GradScaler to unscale, causing:
+    # "Attempting to unscale FP16 gradients."
+    model = AutoModelForCausalLM.from_pretrained(args.model)
+    model = model.to(dtype=torch.float32)
     model.config.use_cache = False
+    if use_cuda:
+        log("Model weights loaded as FP32; Trainer will use FP16 autocast on the Tesla T4.")
+    else:
+        log("Model weights loaded as FP32; training will use full precision on CPU.")
 
     formatted = []
     for item in examples:
@@ -1525,9 +1534,14 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": 0.01,
-        "lr_scheduler_type": "cosine",
-        eval_key: "epoch",
-        "save_strategy": "epoch",
+        # This is a time-bounded run, not a fixed-epoch run. A constant
+        # scheduler with a short warmup avoids stretching the warmup over the
+        # deliberately high epoch ceiling used to keep training alive for 7h.
+        "lr_scheduler_type": "constant_with_warmup",
+        eval_key: "steps",
+        "save_strategy": "steps",
+        "eval_steps": 1000,
+        "save_steps": 1000,
         "logging_strategy": "steps",
         "logging_steps": 25,
         "fp16": bool(use_cuda and not args.no_fp16),
@@ -1544,29 +1558,17 @@ def train_model(examples: List[dict], args: argparse.Namespace, output_dir: Path
         "dataloader_num_workers": args.num_workers,
     }
 
-    # Preserve the intended 5% learning-rate warmup. Older Transformers
-    # releases have warmup_steps but do not have warmup_ratio.
-    if "warmup_ratio" in ta_params:
-        training_kwargs["warmup_ratio"] = 0.05
-    elif "warmup_steps" in ta_params:
-        device_count = max(1, torch.cuda.device_count() if use_cuda else 1)
-        micro_batches_per_epoch = math.ceil(
-            len(train_dataset) / (args.batch_size * device_count)
-        )
-        optimizer_steps_per_epoch = math.ceil(
-            micro_batches_per_epoch / max(1, args.gradient_accumulation_steps)
-        )
-        estimated_total_steps = max(1, math.ceil(optimizer_steps_per_epoch * args.epochs))
-        training_kwargs["warmup_steps"] = max(1, round(estimated_total_steps * 0.05))
-        log(
-            "Installed Transformers has no warmup_ratio; using "
-            f"warmup_steps={training_kwargs['warmup_steps']} (approximately 5%)."
-        )
+    # The time limit, rather than a small epoch count, is the primary stop
+    # condition. Keep warmup short so a 1000-epoch ceiling does not make the
+    # learning rate spend the entire 7-hour run warming up.
+    if "warmup_steps" in ta_params:
+        training_kwargs["warmup_steps"] = 100
+        log("Using constant_with_warmup scheduler with 100 warmup steps.")
+    elif "warmup_ratio" in ta_params:
+        training_kwargs["warmup_ratio"] = 0.0001
+        log("Using constant_with_warmup scheduler with a short warmup ratio.")
     else:
-        log(
-            "WARNING: Installed Transformers supports neither warmup_ratio nor "
-            "warmup_steps; continuing without LR warmup."
-        )
+        log("WARNING: Installed Transformers supports no warmup option; continuing without warmup.")
 
     # Drop only parameters absent from this installed Transformers version.
     # This also prevents the same kind of TypeError for other newer options.
@@ -1717,8 +1719,8 @@ def parse_args() -> argparse.Namespace:
         help="Pause between Firecrawl search calls; 7s stays below a 10-requests/minute limit.",
     )
 
-    parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "10")))
-    parser.add_argument("--max-training-hours", type=float, default=float(os.environ.get("FLORR_MAX_TRAINING_HOURS", "9")), help="Stop fine-tuning after this many hours; 0 disables the time limit")
+    parser.add_argument("--epochs", type=float, default=float(os.environ.get("FLORR_EPOCHS", "1000")), help="Safety ceiling for epochs; the 7-hour time limit normally stops training first")
+    parser.add_argument("--max-training-hours", type=float, default=float(os.environ.get("FLORR_MAX_TRAINING_HOURS", "7")), help="Stop fine-tuning after this many hours; 0 disables the time limit")
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("FLORR_BATCH_SIZE", "4")))
     parser.add_argument("--eval-batch-size", type=int, default=int(os.environ.get("FLORR_EVAL_BATCH_SIZE", "4")))
     parser.add_argument("--gradient-accumulation-steps", type=int, default=int(os.environ.get("FLORR_GRAD_ACCUM", "8")))
